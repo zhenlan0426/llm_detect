@@ -1,1 +1,2 @@
 # llm_detect
+He had an exceptionally successful year, marked by his completion of multiple model reviews and his outstanding work in OPM during Q3. His most notable contribution was in the CARS ML model review, a pioneering machine learning model in the underwriting domain. He played a crucial role in analyzing and quantifying the impact of interventional SHAP versus groupSHAP, leading to significant discoveries in our model review. Additionally, his work on the CFM model review was well-received and highly regarded across various teams.
