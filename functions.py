@@ -1,5 +1,6 @@
 from torch.utils.data import Dataset, DataLoader
 # import nlpaug.augmenter.word as naw
+from transformers import MistralForCausalLM, MistralForSequenceClassification
 import torch
 import torch.nn as nn
 from functools import partial
@@ -60,5 +61,64 @@ def collate_factory(data,tokenizer,IsTrain,prompt,prompt_mask):
     else:
         return input_ids,attention_mask
 
-collate_fn = partial(collate_factory,IsTrain=True,prompt=None,prompt_mask=None)
-collate_inf = partial(collate_factory,IsTrain=False,prompt=None,prompt_mask=None)
+collate_fn = partial(collate_factory,IsTrain=True)
+collate_inf = partial(collate_factory,IsTrain=False)
+
+
+#############
+### Model ###
+#############
+
+class LM(object):
+    def setup(self, tokenizer,num_virtual_tokens,alpha,config_type):
+        self.pos_ = tokenizer('Yes yes',add_special_tokens=False,return_attention_mask=False)['input_ids']
+        self.neg_ = tokenizer('No no',add_special_tokens=False,return_attention_mask=False)['input_ids']
+        self.vocab_size = tokenizer.vocab_size
+        self.num_virtual_tokens_ = 0 if (config_type == 'prefix' or config_type == 'LoRA') else num_virtual_tokens 
+        self.alpha_ = alpha
+        self.loss_bce_ = torch.nn.BCEWithLogitsLoss()
+        self.loss_lm_ = torch.nn.CrossEntropyLoss()
+        
+    def predict(self,input_ids,attention_mask,*args,**kwargs):
+        if not hasattr(self,'alpha_'):
+            raise AttributeError('need to call setup first')
+        out = self.__call__(input_ids,attention_mask,*args,**kwargs)
+        logits = out.logits[:,-1,self.pos_].sum(-1) - out.logits[:,-1,self.neg_].sum(-1)
+        return logits
+    
+    def get_loss(self,input_ids,attention_mask,label,score,*args,**kwargs):
+        out = self.__call__(input_ids,attention_mask,*args,**kwargs)
+        loss_bce = self.loss_bce_(out.logits[:,-1,self.pos_].sum(-1) - out.logits[:,-1,self.neg_].sum(-1),label)
+        
+        # LM objective
+        shift_logits = out.logits[..., self.num_virtual_tokens_:-1, :].contiguous()
+        shift_labels = input_ids[..., 1:].contiguous()
+        # Flatten the tokens
+        shift_logits = shift_logits.view(-1, self.vocab_size)
+        shift_labels = shift_labels.view(-1)
+        # Enable model parallelism
+        shift_labels = shift_labels.to(shift_logits.device)
+        loss_lm = self.loss_lm_(shift_logits, shift_labels)
+        return loss_bce + self.alpha_ * loss_lm
+
+class Classification(object):
+    def setup(self,alpha=0.05):
+        self.alpha_ = alpha
+        self.loss_bce_ = torch.nn.BCEWithLogitsLoss()
+        self.loss_score_ = lambda y,yhat: torch.sum((y!=-1.)*torch.abs(yhat-y))/torch.sum((y!=-1.)+0.01)
+        
+    def predict(self,input_ids,attention_mask,*args,**kwargs):
+        if not hasattr(self,'alpha_'):
+            raise AttributeError('need to call setup first')
+        out = self.__call__(input_ids,attention_mask,*args,**kwargs).logits
+        return out[:,0]
+    
+    def get_loss(self,input_ids,attention_mask,label,score,*args,**kwargs):
+        out = self.__call__(input_ids,attention_mask,*args,**kwargs).logits
+        return self.loss_bce_(out[:,0], label) + self.alpha_ * self.loss_score_(score,out[:,1])
+
+class MistralForClass(MistralForSequenceClassification,Classification):
+    pass
+
+class MistralForLM(MistralForCausalLM,LM):
+    pass
