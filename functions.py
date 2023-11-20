@@ -2,6 +2,8 @@ from torch.utils.data import Dataset, DataLoader
 # import nlpaug.augmenter.word as naw
 # from transformers import MistralForCausalLM, MistralForSequenceClassification
 import torch
+from torch.autograd import Function
+import torch.nn as nn
 import numpy as np
 from functools import partial
 from peft import (
@@ -65,12 +67,13 @@ class TxtData(InfData):
             text = self.aug(text)[0]
         label = self.df.label[idx]
         score = self.df.score[idx]
-        return text, label, score
+        topic = self.df.topics[idx]
+        return text, label, score,topic
 
 def collate_factory(data,tokenizer,IsTrain,prompt,prompt_mask):
     # prompt should be encoded
     if IsTrain:
-        text, label, score = zip(*data)
+        text, label, score, topic = zip(*data)
     else:
         text = data
     kwargs = {  'add_special_tokens': True,  # Add '[CLS]' and '[SEP]'
@@ -91,7 +94,7 @@ def collate_factory(data,tokenizer,IsTrain,prompt,prompt_mask):
         attention_mask = torch.cat([attention_mask,prompt_mask.broadcast_to(n,-1)],1)
 
     if IsTrain:
-        return input_ids,attention_mask, torch.tensor(label, dtype=torch.float32), torch.tensor(score, dtype=torch.float32)
+        return input_ids,attention_mask, torch.tensor(label, dtype=torch.float32), torch.tensor(score, dtype=torch.float32),torch.tensor(topic,dtype=torch.long)
     else:
         return input_ids,attention_mask
 
@@ -102,9 +105,50 @@ collate_inf = partial(collate_factory,IsTrain=False)
 #############
 ### Model ###
 #############
+class GradientReversalFunction(Function):
+    
+    @staticmethod
+    def forward(ctx, x):
+        return x.to(dtype=torch.float32)
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        return (grad_output * -1,)
 
-class LM(object):
-    def __init__(self, model,tokenizer,num_virtual_tokens,alpha,config_type):
+class GradientReversalLayer(nn.Module):
+    def forward(self, x):
+        return GradientReversalFunction.apply(x)
+
+class MLP(nn.Module):
+    def __init__(self, input_dim, output_dim, num_layers, hidden_dim, dropout_prob):
+        super(MLP, self).__init__()
+        self.num_layers = num_layers
+        layers = [nn.Linear(input_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout_prob)]
+        for _ in range(num_layers - 1):
+            layers.extend([
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout_prob)
+            ])
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.layers = nn.Sequential(*layers)
+        self.grad_rev = GradientReversalLayer()
+    
+    def forward(self, x):
+        return self.layers(self.grad_rev(x))
+        
+class DAT(object):
+    def __init__(self,topicModel,beta_):
+        self.topicModel = topicModel
+        self.beta_ = beta_
+        self.loss_topic = torch.nn.CrossEntropyLoss()
+    def get_DAT_loss(self,hidden,topic):
+        logits = self.topicModel(hidden) # n,C
+        return self.beta_ * self.loss_topic(logits,topic)
+        
+class LM(DAT):
+    def __init__(self, model,tokenizer,num_virtual_tokens,alpha,config_type,topicModel,beta_):
+        super().__init__(topicModel,beta_)
         self.model = model
         self.pos_ = tokenizer('Yes yes',add_special_tokens=False,return_attention_mask=False)['input_ids']
         self.neg_ = tokenizer('No no',add_special_tokens=False,return_attention_mask=False)['input_ids']
@@ -120,7 +164,7 @@ class LM(object):
             logits = out.logits[:,-1,self.pos_].sum(-1) - out.logits[:,-1,self.neg_].sum(-1)
             return logits
     
-    def get_loss(self,input_ids,attention_mask,label,score,*args,**kwargs):
+    def get_loss(self,input_ids,attention_mask,label,score,topic,*args,**kwargs):
         out = self.model(input_ids,attention_mask,*args,**kwargs)
         loss_bce = self.loss_bce_(out.logits[:,-1,self.pos_].sum(-1) - out.logits[:,-1,self.neg_].sum(-1),label)
         
@@ -133,10 +177,11 @@ class LM(object):
         # Enable model parallelism
         shift_labels = shift_labels.to(shift_logits.device)
         loss_lm = self.loss_lm_(shift_logits, shift_labels)
-        return loss_bce + self.alpha_ * loss_lm
+        return loss_bce + self.alpha_ * loss_lm + self.get_DAT_loss(out.hidden_states.mean(dim=1),topic)
 
-class Classification(object):
-    def __init__(self,model, alpha):
+class Classification(DAT):
+    def __init__(self,model, alpha,topicModel,beta_):
+        super().__init__(topicModel,beta_)
         self.model = model
         self.alpha_ = alpha
         self.loss_bce_ = torch.nn.BCEWithLogitsLoss()
@@ -147,9 +192,9 @@ class Classification(object):
             out = self.model(input_ids,attention_mask,*args,**kwargs).logits
             return out[:,0]
     
-    def get_loss(self,input_ids,attention_mask,label,score,*args,**kwargs):
+    def get_loss(self,input_ids,attention_mask,label,score,topic,*args,**kwargs):
         out = self.model(input_ids,attention_mask,*args,**kwargs).logits
-        return self.loss_bce_(out[:,0], label) + self.alpha_ * self.loss_score_(score,out[:,1])
+        return self.loss_bce_(out[:,0], label) + self.alpha_ * self.loss_score_(score,out[:,1]) + self.get_DAT_loss(out.hidden_states.mean(dim=1),topic)
 
 def get_random_config(config_type,pred_type,TARGET_MODEL):
     if config_type == 'prefix':
